@@ -6,7 +6,10 @@ import {
   reactive,
   createApp,
   expectError,
-  expectType
+  expectType,
+  ComponentPublicInstance,
+  ComponentOptions,
+  SetupContext
 } from './index'
 
 describe('with object props', () => {
@@ -669,4 +672,24 @@ describe('emits', () => {
       expectError(this.$emit('nope'))
     }
   })
+
+  // without emits
+  defineComponent({
+    setup(props, { emit }) {
+      emit('test', 1)
+      emit('test')
+    }
+  })
+
+  // emit should be valid when ComponentPublicInstance is used.
+  const instance = {} as ComponentPublicInstance
+  instance.$emit('test', 1)
+  instance.$emit('test')
+})
+
+describe('componentOptions setup should be `SetupContext`', () => {
+  expect<ComponentOptions['setup']>({} as (
+    props: Record<string, any>,
+    ctx: SetupContext
+  ) => any)
 })

@@ -8,7 +8,8 @@ import {
   normalizeClass,
   normalizeStyle,
   PatchFlags,
-  ShapeFlags
+  ShapeFlags,
+  SlotFlags
 } from '@vue/shared'
 import {
   ComponentInternalInstance,
@@ -32,6 +33,7 @@ import { TeleportImpl, isTeleport } from './components/Teleport'
 import { currentRenderingInstance } from './componentRenderUtils'
 import { RendererNode, RendererElement } from './renderer'
 import { NULL_DYNAMIC_COMPONENT } from './helpers/resolveAssets'
+import { hmrDirtyComponents } from './hmr'
 
 export const Fragment = (Symbol(__DEV__ ? 'Fragment' : undefined) as any) as {
   __isFragment: true
@@ -45,6 +47,7 @@ export const Static = Symbol(__DEV__ ? 'Static' : undefined)
 
 export type VNodeTypes =
   | string
+  | VNode
   | Component
   | typeof Text
   | typeof Static
@@ -91,8 +94,7 @@ type VNodeChildAtom =
   | undefined
   | void
 
-export interface VNodeArrayChildren
-  extends Array<VNodeArrayChildren | VNodeChildAtom> {}
+export type VNodeArrayChildren = Array<VNodeArrayChildren | VNodeChildAtom>
 
 export type VNodeChild = VNodeChildAtom | VNodeArrayChildren
 
@@ -236,7 +238,7 @@ export function isSameVNodeType(n1: VNode, n2: VNode): boolean {
   if (
     __DEV__ &&
     n2.shapeFlag & ShapeFlags.COMPONENT &&
-    (n2.type as Component).__hmrUpdated
+    hmrDirtyComponents.has(n2.type as Component)
   ) {
     // HMR only: if the component has been hot-updated, force a reload.
     return false
@@ -276,12 +278,13 @@ export const InternalObjectKey = `__vInternal`
 const normalizeKey = ({ key }: VNodeProps): VNode['key'] =>
   key != null ? key : null
 
-const normalizeRef = ({ ref }: VNodeProps): VNode['ref'] =>
-  (ref != null
+const normalizeRef = ({ ref }: VNodeProps): VNode['ref'] => {
+  return (ref != null
     ? isArray(ref)
       ? ref
       : [currentRenderingInstance!, ref]
     : null) as any
+}
 
 export const createVNode = (__DEV__
   ? createVNodeWithArgsTransform
@@ -300,6 +303,10 @@ function _createVNode(
       warn(`Invalid vnode type when creating vnode: ${type}.`)
     }
     type = Comment
+  }
+
+  if (isVNode(type)) {
+    return cloneVNode(type, props, children)
   }
 
   // class component normalization.
@@ -377,6 +384,11 @@ function _createVNode(
     appContext: null
   }
 
+  // validate key
+  if (__DEV__ && vnode.key !== vnode.key) {
+    warn(`VNode created with invalid key (NaN). VNode type:`, vnode.type)
+  }
+
   normalizeChildren(vnode, children)
 
   // presence of a patch flag indicates this node needs patching on updates.
@@ -404,22 +416,23 @@ function _createVNode(
 
 export function cloneVNode<T, U>(
   vnode: VNode<T, U>,
-  extraProps?: Data & VNodeProps
+  extraProps?: Data & VNodeProps | null,
+  children?: unknown
 ): VNode<T, U> {
-  const props = (extraProps
+  const props = extraProps
     ? vnode.props
       ? mergeProps(vnode.props, extraProps)
       : extend({}, extraProps)
-    : vnode.props) as any
+    : vnode.props
   // This is intentionally NOT using spread or extend to avoid the runtime
   // key enumeration cost.
-  return {
+  const cloned: VNode<T, U> = {
     __v_isVNode: true,
     __v_skip: true,
     type: vnode.type,
     props,
     key: props && normalizeKey(props),
-    ref: props && normalizeRef(props),
+    ref: extraProps && extraProps.ref ? normalizeRef(extraProps) : vnode.ref,
     scopeId: vnode.scopeId,
     children: vnode.children,
     target: vnode.target,
@@ -450,6 +463,10 @@ export function cloneVNode<T, U>(
     el: vnode.el,
     anchor: vnode.anchor
   }
+  if (children) {
+    normalizeChildren(cloned, children)
+  }
+  return cloned
 }
 
 /**
@@ -526,10 +543,22 @@ export function normalizeChildren(vnode: VNode, children: unknown) {
       return
     } else {
       type = ShapeFlags.SLOTS_CHILDREN
-      if (!(children as RawSlots)._ && !(InternalObjectKey in children!)) {
+      const slotFlag = (children as RawSlots)._
+      if (!slotFlag && !(InternalObjectKey in children!)) {
         // if slots are not normalized, attach context instance
         // (compiled / normalized slots already have context)
         ;(children as RawSlots)._ctx = currentRenderingInstance
+      } else if (slotFlag === SlotFlags.FORWARDED && currentRenderingInstance) {
+        // a child component receives forwarded slots from the parent.
+        // its slot type is determined by its parent's slot type.
+        if (
+          currentRenderingInstance.vnode.patchFlag & PatchFlags.DYNAMIC_SLOTS
+        ) {
+          ;(children as RawSlots)._ = SlotFlags.DYNAMIC
+          vnode.patchFlag |= PatchFlags.DYNAMIC_SLOTS
+        } else {
+          ;(children as RawSlots)._ = SlotFlags.STABLE
+        }
       }
     }
   } else if (isFunction(children)) {
@@ -552,8 +581,7 @@ export function normalizeChildren(vnode: VNode, children: unknown) {
 const handlersRE = /^on|^vnode/
 
 export function mergeProps(...args: (Data & VNodeProps)[]) {
-  const ret: Data = {}
-  extend(ret, args[0])
+  const ret = extend({}, args[0])
   for (let i = 1; i < args.length; i++) {
     const toMerge = args[i]
     for (const key in toMerge) {
@@ -569,7 +597,7 @@ export function mergeProps(...args: (Data & VNodeProps)[]) {
         const incoming = toMerge[key]
         if (existing !== incoming) {
           ret[key] = existing
-            ? [].concat(existing as any, toMerge[key] as any)
+            ? [].concat(existing as any, toMerge[key])
             : incoming
         }
       } else {
